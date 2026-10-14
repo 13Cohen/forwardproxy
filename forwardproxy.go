@@ -101,6 +101,7 @@ type Handler struct {
 
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
+	lookupIP    func(ctx context.Context, network, host string) ([]net.IP, error)
 	upstream    *url.URL // address of upstream proxy
 
 	aclRules []aclRule
@@ -281,7 +282,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 			fmt.Errorf("unsupported HTTP major version: %d", r.ProtoMajor))
 	}
 
-	ctx := context.Background()
+	ctx := r.Context()
 	if !h.HideIP {
 		ctxHeader := make(http.Header)
 		for k, v := range r.Header {
@@ -330,7 +331,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if hostPort == "" {
 			hostPort = r.Host
 		}
+		dialStart := time.Now()
 		targetConn, err := h.dialContextCheckACL(ctx, "tcp", hostPort)
+		if extra, ok := ctx.Value(caddyhttp.ExtraLogFieldsCtxKey).(*caddyhttp.ExtraLogFields); ok {
+			extra.Set(zap.Float64("proxy_dial_ms", float64(time.Since(dialStart))/float64(time.Millisecond)))
+			extra.Set(zap.Bool("proxy_dial_ok", err == nil && targetConn != nil))
+		}
 		if err != nil {
 			return err
 		}
@@ -341,6 +347,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 				fmt.Errorf("hostname %s is not allowed", r.URL.Hostname()))
 		}
 		defer targetConn.Close()
+		stopCancel := context.AfterFunc(ctx, func() { targetConn.Close() })
+		defer stopCancel()
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
@@ -501,6 +509,12 @@ func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
 // dialContextCheckACL enforces Access Control List and calls fp.DialContext
 func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
 	var conn net.Conn
+	timeout := time.Duration(h.DialTimeout)
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
 		// return nil, &proxyError{S: "Network " + network + " is not supported", Code: http.StatusBadRequest}
@@ -542,29 +556,36 @@ match:
 		}
 	}
 
-	// in case IP was provided, net.LookupIP will simply return it
-	IPs, err := net.LookupIP(host)
+	// The request deadline covers DNS and every candidate, not one timeout per IP.
+	lookup := h.lookupIP
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIP
+	}
+	lookupNetwork := "ip"
+	if network == "tcp4" {
+		lookupNetwork = "ip4"
+	}
+	if network == "tcp6" {
+		lookupNetwork = "ip6"
+	}
+	IPs, err := lookup(ctx, lookupNetwork, host)
 	if err != nil {
-		// return nil, &proxyError{S: fmt.Sprintf("Lookup of %s failed: %v", host, err),
-		// Code: http.StatusBadGateway}
-		return nil, caddyhttp.Error(http.StatusBadGateway,
-			fmt.Errorf("lookup of %s failed: %v", host, err))
+		return nil, caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("lookup of %s failed: %w", host, err))
 	}
-
-	// This is net.Dial's default behavior: if the host resolves to multiple IP addresses,
-	// Dial will try each IP address in order until one succeeds
+	allowed := make([]net.IP, 0, len(IPs))
 	for _, ip := range IPs {
-		if !h.hostIsAllowed(host, ip) {
-			continue
-		}
-
-		conn, err = h.dialContext(ctx, network, net.JoinHostPort(ip.String(), port))
-		if err == nil {
-			return conn, nil
+		if h.hostIsAllowed(host, ip) {
+			allowed = append(allowed, ip)
 		}
 	}
-
-	return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+	if len(allowed) == 0 {
+		return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+	}
+	conn, err = h.dialAllowed(ctx, network, port, allowed)
+	if err != nil {
+		return nil, caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("dial of %s failed: %w", host, err))
+	}
+	return conn, nil
 }
 
 func (h Handler) hostIsAllowed(hostname string, ip net.IP) bool {
@@ -658,29 +679,53 @@ const (
 	NumFirstPaddings = 8
 )
 
-// Copies data target->clientReader and clientWriter->target, and flushes as needed
-// Returns when clientWriter-> target stream is done.
-// Caddy should finish writing target -> clientReader.
+// dualStream preserves a clean client half-close, but an upload failure must
+// unblock the target reader. Both copy loops finish before their buffers/reader
+// can be reused by the HTTP server. The caller owns cancellation of target.
 func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
 	stream := func(w io.Writer, r io.Reader, paddingType int) error {
-		// copy bytes from r to w
 		bufPtr := bufferPool.Get().(*[]byte)
-		buf := *bufPtr
-		buf = buf[0:cap(buf)]
-		_, _err := flushingIoCopy(w, r, buf, paddingType)
-		bufferPool.Put(bufPtr)
-
-		if cw, ok := w.(closeWriter); ok {
-			_ = cw.CloseWrite()
+		defer bufferPool.Put(bufPtr)
+		_, err := flushingIoCopy(w, r, (*bufPtr)[:cap(*bufPtr)], paddingType)
+		if err == nil {
+			if cw, ok := w.(closeWriter); ok {
+				_ = cw.CloseWrite()
+			}
 		}
-		return _err
+		return err
 	}
+	uploadPadding, downloadPadding := NoPadding, NoPadding
 	if padding {
-		go stream(target, clientReader, RemovePadding)
-		return stream(clientWriter, target, AddPadding)
+		uploadPadding, downloadPadding = RemovePadding, AddPadding
 	}
-	go stream(target, clientReader, NoPadding) //nolint: errcheck
-	return stream(clientWriter, target, NoPadding)
+	uploadDone := make(chan error, 1)
+	go func() {
+		err := stream(target, clientReader, uploadPadding)
+		if err != nil {
+			target.Close()
+		}
+		uploadDone <- err
+	}()
+	downloadErr := stream(clientWriter, target, downloadPadding)
+	// Check whether upload failed before our cleanup, so closing the request
+	// body after a normal target EOF does not manufacture a client failure.
+	var uploadErr error
+	select {
+	case uploadErr = <-uploadDone:
+		target.Close()
+		clientReader.Close()
+	default:
+		target.Close()
+		clientReader.Close()
+		uploadErr = <-uploadDone
+		if downloadErr == nil {
+			uploadErr = nil
+		}
+	}
+	if uploadErr != nil {
+		return fmt.Errorf("upload: %w", uploadErr)
+	}
+	return downloadErr
 }
 
 type closeWriter interface {
@@ -716,14 +761,17 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 			}
 		} else if paddingType == RemovePadding && numPadding < NumFirstPaddings {
 			numPadding++
-			nr, er = io.ReadFull(src, buf[0:3])
-			if nr > 0 {
-				nr = int(buf[0])*256 + int(buf[1])
-				paddingSize := int(buf[2])
-				nr, er = io.ReadFull(src, buf[0:nr])
-				if nr > 0 {
+			if _, er = io.ReadFull(src, buf[:3]); er == nil {
+				dataSize, paddingSize := int(buf[0])*256+int(buf[1]), int(buf[2])
+				nr, er = io.ReadFull(src, buf[:dataSize])
+				if er == nil {
 					var junk [256]byte
-					_, er = io.ReadFull(src, junk[0:paddingSize])
+					_, er = io.ReadFull(src, junk[:paddingSize])
+					if er == io.EOF && paddingSize > 0 {
+						er = io.ErrUnexpectedEOF
+					}
+				} else if er == io.EOF && dataSize > 0 {
+					er = io.ErrUnexpectedEOF
 				}
 			}
 		} else {
