@@ -35,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -55,6 +56,10 @@ func init() {
 // EXPERIMENTAL: This handler is still experimental and subject to breaking changes.
 type Handler struct {
 	logger *zap.Logger
+
+	// Diagnostics adds bounded, content-free CONNECT statistics to access logs.
+	// It is off by default; no identifiers or diagnostics are sent to clients.
+	Diagnostics bool `json:"diagnostics,omitempty"`
 
 	// Filename of the PAC file to serve.
 	PACPath string `json:"pac_path,omitempty"`
@@ -245,7 +250,7 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) (retErr error) {
 	// start by splitting the request host and port
 	reqHost, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -305,6 +310,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		// HTTP CONNECT Fast Open: Directly responds with a 200 OK
 		// before attempting to connect to origin to reduce response latency.
 		// We merely close the connection if Open fails.
+		var obs *tunnelObservation
+		if h.Diagnostics {
+			obs = newObservation(ctx)
+			if obs != nil {
+				ctx = context.WithValue(ctx, observationKey{}, obs)
+				defer func() { obs.finish(ctx, retErr) }()
+			}
+		}
 
 		// Creates a padding header with length in [30, 30+32)
 		paddingLen := rand.Intn(32) + 30
@@ -349,15 +362,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		defer targetConn.Close()
 		stopCancel := context.AfterFunc(ctx, func() { targetConn.Close() })
 		defer stopCancel()
+		if obs != nil {
+			obs.stage = "transfer"
+		}
 
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
+			return serveHijack(w, targetConn, obs)
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
 			defer r.Body.Close()
-			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			return dualStreamObserved(targetConn, r.Body, w, r.Header.Get("Padding") != "", obs)
 		}
 
 		panic("There was a check for http version, yet it's incorrect")
@@ -509,6 +525,10 @@ func (h Handler) servePacFile(w http.ResponseWriter, r *http.Request) error {
 // dialContextCheckACL enforces Access Control List and calls fp.DialContext
 func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort string) (net.Conn, error) {
 	var conn net.Conn
+	obs := observation(ctx)
+	if obs != nil {
+		obs.stage = "validation"
+	}
 	timeout := time.Duration(h.DialTimeout)
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -529,6 +549,10 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 	}
 
 	if h.upstream != nil {
+		if obs != nil {
+			obs.stage = "upstream_dial"
+			obs.attempts = 1
+		}
 		// if upstreaming -- do not resolve locally nor check acl
 		conn, err = h.dialContext(ctx, network, hostPort)
 		if err != nil {
@@ -542,6 +566,9 @@ func (h Handler) dialContextCheckACL(ctx context.Context, network, hostPort stri
 		// return nil, &proxyError{S: "port " + port + " is not allowed", Code: http.StatusForbidden}
 		return nil, caddyhttp.Error(http.StatusForbidden,
 			fmt.Errorf("port %s is not allowed", port))
+	}
+	if obs != nil {
+		obs.stage = "acl"
 	}
 
 match:
@@ -568,11 +595,23 @@ match:
 	if network == "tcp6" {
 		lookupNetwork = "ip6"
 	}
+	var dnsStart time.Time
+	if obs != nil {
+		obs.stage = "dns"
+		dnsStart = time.Now()
+	}
 	IPs, err := lookup(ctx, lookupNetwork, host)
+	if obs != nil {
+		obs.dnsMS = milliseconds(time.Since(dnsStart))
+		obs.dnsObserved = true
+	}
 	if err != nil {
 		return nil, caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("lookup of %s failed: %w", host, err))
 	}
 	allowed := make([]net.IP, 0, len(IPs))
+	if obs != nil {
+		obs.stage = "acl"
+	}
 	for _, ip := range IPs {
 		if h.hostIsAllowed(host, ip) {
 			allowed = append(allowed, ip)
@@ -580,6 +619,10 @@ match:
 	}
 	if len(allowed) == 0 {
 		return nil, caddyhttp.Error(http.StatusForbidden, fmt.Errorf("no allowed IP addresses for %s", host))
+	}
+	if obs != nil {
+		obs.stage = "dial"
+		obs.candidates = len(allowed)
 	}
 	conn, err = h.dialAllowed(ctx, network, port, allowed)
 	if err != nil {
@@ -649,7 +692,7 @@ func serveHiddenPage(w http.ResponseWriter, authErr error) error {
 
 // Hijacks the connection from ResponseWriter, writes the response and proxies data between targetConn
 // and hijacked connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
+func serveHijack(w http.ResponseWriter, targetConn net.Conn, obs *tunnelObservation) error {
 	w.WriteHeader(http.StatusOK)
 	clientConn, brw, err := http.NewResponseController(w).Hijack()
 	if err != nil {
@@ -669,7 +712,7 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 			fmt.Errorf("failed to flush to client: %v", err))
 	}
 
-	return dualStream(targetConn, clientConn, clientConn, false)
+	return dualStreamObserved(targetConn, clientConn, clientConn, false, obs)
 }
 
 const (
@@ -683,10 +726,14 @@ const (
 // unblock the target reader. Both copy loops finish before their buffers/reader
 // can be reused by the HTTP server. The caller owns cancellation of target.
 func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
-	stream := func(w io.Writer, r io.Reader, paddingType int) error {
+	return dualStreamObserved(target, clientReader, clientWriter, padding, nil)
+}
+
+func dualStreamObserved(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool, obs *tunnelObservation) error {
+	stream := func(w io.Writer, r io.Reader, paddingType int, stat *streamObservation) error {
 		bufPtr := bufferPool.Get().(*[]byte)
 		defer bufferPool.Put(bufPtr)
-		_, err := flushingIoCopy(w, r, (*bufPtr)[:cap(*bufPtr)], paddingType)
+		_, err := flushingIoCopyObserved(w, r, (*bufPtr)[:cap(*bufPtr)], paddingType, stat)
 		if err == nil {
 			if cw, ok := w.(closeWriter); ok {
 				_ = cw.CloseWrite()
@@ -698,34 +745,39 @@ func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Wri
 	if padding {
 		uploadPadding, downloadPadding = RemovePadding, AddPadding
 	}
-	uploadDone := make(chan error, 1)
+	var uploadStat, downloadStat *streamObservation
+	if obs != nil {
+		uploadStat, downloadStat = &obs.upload, &obs.download
+	}
+	uploadDone := make(chan struct{})
+	firstError := make(chan error, 2)
+	var cleaningUp atomic.Bool
 	go func() {
-		err := stream(target, clientReader, uploadPadding)
+		err := stream(target, clientReader, uploadPadding, uploadStat)
 		if err != nil {
+			if !cleaningUp.Load() {
+				firstError <- &streamFailure{"upload", err}
+			}
 			target.Close()
 		}
-		uploadDone <- err
+		close(uploadDone)
 	}()
-	downloadErr := stream(clientWriter, target, downloadPadding)
-	// Check whether upload failed before our cleanup, so closing the request
-	// body after a normal target EOF does not manufacture a client failure.
-	var uploadErr error
+	downloadErr := stream(clientWriter, target, downloadPadding, downloadStat)
+	if downloadErr != nil {
+		firstError <- &streamFailure{"download", downloadErr}
+	}
+	// Preserve the initiating error. Closing the client body to clean up a
+	// failed download must not replace a target reset with a synthetic upload error.
+	cleaningUp.Store(true)
+	target.Close()
+	clientReader.Close()
+	<-uploadDone
 	select {
-	case uploadErr = <-uploadDone:
-		target.Close()
-		clientReader.Close()
+	case err := <-firstError:
+		return err
 	default:
-		target.Close()
-		clientReader.Close()
-		uploadErr = <-uploadDone
-		if downloadErr == nil {
-			uploadErr = nil
-		}
+		return nil
 	}
-	if uploadErr != nil {
-		return fmt.Errorf("upload: %w", uploadErr)
-	}
-	return downloadErr
 }
 
 type closeWriter interface {
@@ -736,15 +788,26 @@ type closeWriter interface {
 // If dst does not implement http.Flusher(e.g. net.TCPConn), it will do a simple io.CopyBuffer().
 // Reasoning: http2ResponseWriter will not flush on its own, so we have to do it manually.
 func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (written int64, err error) {
+	return flushingIoCopyObserved(dst, src, buf, paddingType, nil)
+}
+
+func flushingIoCopyObserved(dst io.Writer, src io.Reader, buf []byte, paddingType int, stat *streamObservation) (written int64, err error) {
 	rw, ok := dst.(http.ResponseWriter)
 	var rc *http.ResponseController
 	if ok {
 		rc = http.NewResponseController(rw)
 	}
 	var numPadding int
+	if stat != nil {
+		stat.start = time.Now()
+	}
 	for {
 		var nr int
 		var er error
+		var readStart time.Time
+		if stat != nil {
+			readStart = time.Now()
+		}
 		if paddingType == AddPadding && numPadding < NumFirstPaddings {
 			numPadding++
 			paddingSize := rand.Intn(256)
@@ -777,30 +840,52 @@ func flushingIoCopy(dst io.Writer, src io.Reader, buf []byte, paddingType int) (
 		} else {
 			nr, er = src.Read(buf)
 		}
+		if stat != nil {
+			stat.maxReadMS = max(stat.maxReadMS, milliseconds(time.Since(readStart)))
+			if nr > 0 && !stat.readSeen {
+				stat.readSeen = true
+				stat.firstReadMS = milliseconds(time.Since(stat.start))
+			}
+		}
 		if nr > 0 {
+			var writeStart time.Time
+			if stat != nil {
+				writeStart = time.Now()
+			}
 			nw, ew := dst.Write(buf[0:nr])
+			if stat != nil {
+				stat.maxWriteMS = max(stat.maxWriteMS, milliseconds(time.Since(writeStart)))
+				stat.written += int64(nw)
+			}
 			if nw > 0 {
 				written += int64(nw)
 			}
 			if ew != nil {
-				err = ew
+				err = &copyFailure{"write", ew}
 				break
 			}
 			if rc != nil {
+				var flushStart time.Time
+				if stat != nil {
+					flushStart = time.Now()
+				}
 				ef := rc.Flush()
+				if stat != nil {
+					stat.maxFlushMS = max(stat.maxFlushMS, milliseconds(time.Since(flushStart)))
+				}
 				if ef != nil {
-					err = ef
+					err = &copyFailure{"flush", ef}
 					break
 				}
 			}
 			if nr != nw {
-				err = io.ErrShortWrite
+				err = &copyFailure{"write", io.ErrShortWrite}
 				break
 			}
 		}
 		if er != nil {
 			if er != io.EOF {
-				err = er
+				err = &copyFailure{"read", er}
 			}
 			break
 		}

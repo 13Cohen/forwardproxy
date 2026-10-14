@@ -1,17 +1,19 @@
-# PCS source fork
+# Reliability fork
 
+Maintained at https://github.com/13Cohen/forwardproxy/tree/pcs/reliability
 Upstream: https://github.com/klzgrad/forwardproxy
 Base commit: `d62c80d3dd2c706b6b87579844d2397bddd18317`
 
-This source fork preserves upstream Git history and license. It is hosted on the
-`source/forwardproxy-reliability` branch of the private `13Cohen/PCS` repository because
-the connected GitHub interface cannot create a separate fork repository. The
-branch can be pushed into a standalone repository later without losing history.
-Upstream workflow files are removed from this source branch; PCS owns deployment.
+This branch preserves upstream Git history and license. The repository's original
+default branch is retained for upstream tracking. PCS owns deployment and pins
+this independent repository by full commit and archive SHA256; source development
+does not belong in PCS. The former temporary PCS source branch is retired after
+migration. Runtime secrets, real client IPs and certificates are never committed.
 
-The production build uses the pinned upstream module plus an audited patch in
-PCS `caddy/`, so Docker builds need no credentials for private Git repositories.
-Runtime secrets, real client IPs and certificates are never stored in this fork.
+Upstream workflow files were removed from the initial experimental branch; this
+branch does not publish upstream release artifacts. CI/deployment is controlled
+by PCS. Contribution branches must start from current upstream, carry only the
+relevant fix and regression test, and preserve the upstream workflow structure.
 
 Integration versions: Caddy 2.11.1, Go 1.25.6, x/net 0.50.0.
 Refer to PCS `caddy/OPERATIONS.md` for experiments, rollout and limitations.

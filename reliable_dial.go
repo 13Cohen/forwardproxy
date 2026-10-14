@@ -24,6 +24,9 @@ func (h Handler) dialAllowed(ctx context.Context, network, port string, ips []ne
 		remaining := len(ips) - next
 		next++
 		active++
+		if obs := observation(ctx); obs != nil {
+			obs.attempts++
+		}
 		go func() {
 			attemptCtx := ctx
 			stop := func() {}

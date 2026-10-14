@@ -92,6 +92,12 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.HideIP = true
 
+		case "diagnostics":
+			if len(d.RemainingArgs()) != 0 {
+				return d.ArgErr()
+			}
+			h.Diagnostics = true
+
 		case "hide_via":
 			args := d.RemainingArgs()
 			if len(args) != 0 {
