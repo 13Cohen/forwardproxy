@@ -3,6 +3,7 @@ package forwardproxy
 import (
 	"context"
 	"errors"
+	"go.uber.org/zap"
 	"net"
 	"time"
 )
@@ -27,7 +28,14 @@ func (h Handler) dialAllowed(ctx context.Context, network, port string, ips []ne
 		if obs := observation(ctx); obs != nil {
 			obs.attempts++
 		}
+		attemptID := next
 		go func() {
+			attemptStart := time.Now()
+			var attemptDone func(error)
+			if obs := observation(ctx); obs != nil {
+				attemptDone = obs.connection.Begin(obs.id, "dial_attempt")
+			}
+
 			attemptCtx := ctx
 			stop := func() {}
 			if deadline, ok := ctx.Deadline(); ok {
@@ -41,6 +49,16 @@ func (h Handler) dialAllowed(ctx context.Context, network, port string, ips []ne
 			}
 			defer stop()
 			conn, err := h.dialContext(attemptCtx, network, net.JoinHostPort(ip.String(), port))
+			if obs := observation(ctx); obs != nil {
+				family := 6
+				if ip.To4() != nil {
+					family = 4
+				}
+				attemptDone(err)
+				if err != nil || time.Since(attemptStart) >= time.Second {
+					obs.connection.Stage(obs.id, "dial_attempt", time.Since(attemptStart), err, zap.Int("attempt", attemptID), zap.Int("address_family", family), zap.Bool("request_context_done", ctx.Err() != nil))
+				}
+			}
 			if err != nil && conn != nil {
 				conn.Close()
 				conn = nil

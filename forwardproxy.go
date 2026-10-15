@@ -610,7 +610,17 @@ match:
 		obs.stage = "dns"
 		dnsStart = time.Now()
 	}
+	var dnsDone func(error)
+	if obs != nil {
+		dnsDone = obs.connection.Begin(obs.id, "dns")
+	}
 	IPs, err := lookup(ctx, lookupNetwork, host)
+	if obs != nil {
+		dnsDone(err)
+		if err != nil || time.Since(dnsStart) >= time.Second {
+			obs.connection.Stage(obs.id, "dns", time.Since(dnsStart), err, zap.Int("result_count", len(IPs)))
+		}
+	}
 	if obs != nil {
 		obs.dnsMS = milliseconds(time.Since(dnsStart))
 		obs.dnsObserved = true

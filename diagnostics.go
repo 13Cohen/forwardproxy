@@ -13,6 +13,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
+	"golang.org/x/net/http2"
 )
 
 type observationKey struct{}
@@ -27,6 +28,7 @@ type tunnelObservation struct {
 	stage           string
 	connection      *caddyhttp.ProxyEvidence
 	responseFlushMS float64
+	h2StreamID      uint32
 	dnsMS           float64
 	dnsObserved     bool
 	candidates      int
@@ -66,6 +68,7 @@ func newObservation(ctx context.Context) *tunnelObservation {
 		return nil
 	}
 	o := &tunnelObservation{fields: fields, start: time.Now(), id: hex.EncodeToString(id[:]), stage: "response", connection: caddyhttp.EnableProxyEvidence(ctx)}
+	o.h2StreamID = http2.ObservationStreamID(ctx)
 	o.upload.requestStart, o.download.requestStart = o.start, o.start
 	o.upload.connection, o.download.connection = o.connection, o.connection
 	o.upload.trace, o.download.trace = o.id, o.id
@@ -105,6 +108,12 @@ func errorClass(err error) string {
 		return "peer_reset"
 	case errors.Is(err, syscall.EPIPE):
 		return "broken_pipe"
+	case errors.Is(err, syscall.EADDRNOTAVAIL):
+		return "address_unavailable"
+	case errors.Is(err, syscall.ENETUNREACH):
+		return "network_unreachable"
+	case errors.Is(err, syscall.EHOSTUNREACH):
+		return "host_unreachable"
 	case errors.Is(err, syscall.ECONNREFUSED):
 		return "refused"
 	case errors.Is(err, io.ErrUnexpectedEOF):
@@ -173,7 +182,7 @@ func (o *tunnelObservation) logFields(ctx context.Context, err error) []zap.Fiel
 		end = "request_canceled"
 	}
 	fields := []zap.Field{
-		zap.Int("proxy_diag_version", 2), zap.String("proxy_trace_id", o.id),
+		zap.Uint32("proxy_h2_stream_id", o.h2StreamID), zap.Int("proxy_diag_version", 3), zap.String("proxy_trace_id", o.id),
 		zap.Float64("proxy_started_unix_ms", float64(o.start.UnixNano())/1e6),
 		zap.String("proxy_connection_id", o.connection.ID()),
 		zap.Float64("proxy_response_flush_ms", o.responseFlushMS),

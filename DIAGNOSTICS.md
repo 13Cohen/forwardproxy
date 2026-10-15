@@ -73,3 +73,16 @@ This adds no client response headers, no body inspection, no new deadlines and n
 changes to authentication/ACL/probe resistance or Naive padding. Exact H2 window
 values are not available; retained TCP_INFO and socket write evidence narrow the
 boundary but must not be relabelled as direct H2 flow-control measurements.
+
+## Schema 3 (pcsproxy4 candidate)
+
+`proxy_h2_stream_id` joins a tunnel to the HTTP2 observer's connection-local stream
+ID; zero means unavailable. Requires the paired Caddy and x/net experimental forks.
+DNS and numeric-address dial attempts are observed while pending. Failed or >=1s
+attempts produce `proxy_stage_complete` records containing trace, phase, elapsed,
+errno, attempt index, address family and whether the shared context was already
+canceled. They contain no hostname/address. Fast successful attempts are omitted
+to protect the logging budget; aggregate attempt count remains in the access row.
+Late canceled losing attempts can appear after handler return; order by event time
+and trace, not line adjacency. EADDRNOTAVAIL/ENETUNREACH/EHOSTUNREACH receive distinct
+access error classes. A final attempt error is not all candidates' failure history.
