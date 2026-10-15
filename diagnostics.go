@@ -21,26 +21,34 @@ type observationKey struct{}
 // own statistics. finish is called only after both stream goroutines have joined.
 // Never emit addresses, credentials, payloads or per-chunk log events here.
 type tunnelObservation struct {
-	fields      *caddyhttp.ExtraLogFields
-	start       time.Time
-	id          string
-	stage       string
-	dnsMS       float64
-	dnsObserved bool
-	candidates  int
-	attempts    int
-	upload      streamObservation
-	download    streamObservation
+	fields          *caddyhttp.ExtraLogFields
+	start           time.Time
+	id              string
+	stage           string
+	connection      *caddyhttp.ProxyEvidence
+	responseFlushMS float64
+	dnsMS           float64
+	dnsObserved     bool
+	candidates      int
+	attempts        int
+	upload          streamObservation
+	download        streamObservation
 }
 
 type streamObservation struct {
-	start       time.Time
-	written     int64
-	firstReadMS float64
-	readSeen    bool
-	maxReadMS   float64
-	maxWriteMS  float64
-	maxFlushMS  float64
+	start            time.Time
+	written          int64
+	firstReadMS      float64
+	readSeen         bool
+	maxReadMS        float64
+	maxWriteMS       float64
+	maxFlushMS       float64
+	maxReadStartMS   float64
+	maxWriteStartMS  float64
+	maxFlushStartMS  float64
+	requestStart     time.Time
+	connection       *caddyhttp.ProxyEvidence
+	trace, direction string
 }
 
 func observation(ctx context.Context) *tunnelObservation {
@@ -57,7 +65,12 @@ func newObservation(ctx context.Context) *tunnelObservation {
 	if _, err := rand.Read(id[:]); err != nil {
 		return nil
 	}
-	return &tunnelObservation{fields: fields, start: time.Now(), id: hex.EncodeToString(id[:]), stage: "response"}
+	o := &tunnelObservation{fields: fields, start: time.Now(), id: hex.EncodeToString(id[:]), stage: "response", connection: caddyhttp.EnableProxyEvidence(ctx)}
+	o.upload.requestStart, o.download.requestStart = o.start, o.start
+	o.upload.connection, o.download.connection = o.connection, o.connection
+	o.upload.trace, o.download.trace = o.id, o.id
+	o.upload.direction, o.download.direction = "upload", "download"
+	return o
 }
 
 func milliseconds(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
@@ -129,6 +142,9 @@ func (o *tunnelObservation) finish(ctx context.Context, err error) {
 
 func (o *tunnelObservation) logFields(ctx context.Context, err error) []zap.Field {
 	class, side := errorClass(err), "none"
+	if o.stage == "response" && err != nil {
+		side = "client_response_flush"
+	}
 	var stream *streamFailure
 	var operation *copyFailure
 	if errors.As(err, &stream) {
@@ -157,7 +173,10 @@ func (o *tunnelObservation) logFields(ctx context.Context, err error) []zap.Fiel
 		end = "request_canceled"
 	}
 	fields := []zap.Field{
-		zap.Int("proxy_diag_version", 1), zap.String("proxy_trace_id", o.id),
+		zap.Int("proxy_diag_version", 2), zap.String("proxy_trace_id", o.id),
+		zap.Float64("proxy_started_unix_ms", float64(o.start.UnixNano())/1e6),
+		zap.String("proxy_connection_id", o.connection.ID()),
+		zap.Float64("proxy_response_flush_ms", o.responseFlushMS),
 		zap.String("proxy_end_reason", end), zap.String("proxy_error_class", class),
 		zap.String("proxy_error_side", side), zap.String("proxy_stage", o.stage),
 		zap.Bool("proxy_request_canceled", ctx.Err() == context.Canceled),
@@ -179,7 +198,10 @@ func (o *tunnelObservation) logFields(ctx context.Context, err error) []zap.Fiel
 		fields = append(fields, zap.Int64(prefix+"written_bytes", s.written),
 			zap.Float64(prefix+"max_read_block_ms", s.maxReadMS),
 			zap.Float64(prefix+"max_write_block_ms", s.maxWriteMS),
-			zap.Float64(prefix+"max_flush_block_ms", s.maxFlushMS))
+			zap.Float64(prefix+"max_flush_block_ms", s.maxFlushMS),
+			zap.Float64(prefix+"max_read_start_ms", s.maxReadStartMS),
+			zap.Float64(prefix+"max_write_start_ms", s.maxWriteStartMS),
+			zap.Float64(prefix+"max_flush_start_ms", s.maxFlushStartMS))
 		if s.readSeen {
 			fields = append(fields, zap.Float64(prefix+"first_read_ms", s.firstReadMS))
 		}

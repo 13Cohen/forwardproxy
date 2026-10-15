@@ -53,3 +53,23 @@ branch for an existing fix, follow CONTRIBUTING.md, and provide a minimal local
 reproducer plus baseline/fixed results. Do not submit production logs containing
 addresses, credentials or browsing history. No upstream PR is implied by this
 experimental branch.
+
+
+## Schema 2 / connection correlation (pcsproxy3)
+
+Requires the paired 13Cohen/caddy reliability fork. `proxy_connection_id` links
+access rows to metadata-only Caddy transport evidence; empty means unavailable
+(e.g. HTTP3 or transport evidence disabled), not zero blocking. `proxy_started_unix_ms`
+is the observation start. `proxy_response_flush_ms` measures initial CONNECT flush;
+its errors preserve the original error chain with `%w` and side client_response_flush.
+The `proxy_{upload,download}_max_{read,write,flush}_start_ms` fields locate each maximum
+relative to proxy_started_unix_ms. Add block_ms to locate its end. Maxima are distinct
+operations, not a single chronological trace; long reads may be ordinary idle time.
+
+The connection observer samples pending response_flush and directional write/flush
+operations while they are blocked, and records completed operations slower than 1s.
+Connection timestamps are anchored separately; join on IDs, not remote IP/port.
+This adds no client response headers, no body inspection, no new deadlines and no
+changes to authentication/ACL/probe resistance or Naive padding. Exact H2 window
+values are not available; retained TCP_INFO and socket write evidence narrow the
+boundary but must not be relabelled as direct H2 flow-control measurements.

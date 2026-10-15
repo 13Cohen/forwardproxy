@@ -334,10 +334,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		w.Header().Set("Padding", string(padding))
 
 		w.WriteHeader(http.StatusOK)
+		var responseStart time.Time
+		var responseDone func(error)
+		if obs != nil {
+			responseStart = time.Now()
+			responseDone = obs.connection.Begin(obs.id, "response_flush")
+		}
 		err := http.NewResponseController(w).Flush()
+		if obs != nil {
+			obs.responseFlushMS = milliseconds(time.Since(responseStart))
+			responseDone(err)
+		}
 		if err != nil {
 			return caddyhttp.Error(http.StatusInternalServerError,
-				fmt.Errorf("ResponseWriter flush error: %v", err))
+				fmt.Errorf("ResponseWriter flush error: %w", err))
 		}
 
 		hostPort := r.URL.Host
@@ -800,6 +810,9 @@ func flushingIoCopyObserved(dst io.Writer, src io.Reader, buf []byte, paddingTyp
 	var numPadding int
 	if stat != nil {
 		stat.start = time.Now()
+		if stat.requestStart.IsZero() {
+			stat.requestStart = stat.start
+		}
 	}
 	for {
 		var nr int
@@ -841,7 +854,10 @@ func flushingIoCopyObserved(dst io.Writer, src io.Reader, buf []byte, paddingTyp
 			nr, er = src.Read(buf)
 		}
 		if stat != nil {
-			stat.maxReadMS = max(stat.maxReadMS, milliseconds(time.Since(readStart)))
+			if elapsed := milliseconds(time.Since(readStart)); elapsed > stat.maxReadMS {
+				stat.maxReadMS = elapsed
+				stat.maxReadStartMS = milliseconds(readStart.Sub(stat.requestStart))
+			}
 			if nr > 0 && !stat.readSeen {
 				stat.readSeen = true
 				stat.firstReadMS = milliseconds(time.Since(stat.start))
@@ -849,12 +865,18 @@ func flushingIoCopyObserved(dst io.Writer, src io.Reader, buf []byte, paddingTyp
 		}
 		if nr > 0 {
 			var writeStart time.Time
+			var writeDone func(error)
 			if stat != nil {
 				writeStart = time.Now()
+				writeDone = stat.connection.Begin(stat.trace, stat.direction+"_write")
 			}
 			nw, ew := dst.Write(buf[0:nr])
 			if stat != nil {
-				stat.maxWriteMS = max(stat.maxWriteMS, milliseconds(time.Since(writeStart)))
+				if elapsed := milliseconds(time.Since(writeStart)); elapsed > stat.maxWriteMS {
+					stat.maxWriteMS = elapsed
+					stat.maxWriteStartMS = milliseconds(writeStart.Sub(stat.requestStart))
+				}
+				writeDone(ew)
 				stat.written += int64(nw)
 			}
 			if nw > 0 {
@@ -866,12 +888,18 @@ func flushingIoCopyObserved(dst io.Writer, src io.Reader, buf []byte, paddingTyp
 			}
 			if rc != nil {
 				var flushStart time.Time
+				var flushDone func(error)
 				if stat != nil {
 					flushStart = time.Now()
+					flushDone = stat.connection.Begin(stat.trace, stat.direction+"_flush")
 				}
 				ef := rc.Flush()
 				if stat != nil {
-					stat.maxFlushMS = max(stat.maxFlushMS, milliseconds(time.Since(flushStart)))
+					if elapsed := milliseconds(time.Since(flushStart)); elapsed > stat.maxFlushMS {
+						stat.maxFlushMS = elapsed
+						stat.maxFlushStartMS = milliseconds(flushStart.Sub(stat.requestStart))
+					}
+					flushDone(ef)
 				}
 				if ef != nil {
 					err = &copyFailure{"flush", ef}

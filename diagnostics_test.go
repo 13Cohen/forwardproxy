@@ -104,6 +104,25 @@ func TestDiagnosticsDialFailureFieldsAndPrivacy(t *testing.T) {
 
 type slowWriter struct{ bytes.Buffer }
 
+type failingResponseFlush struct{ *httptest.ResponseRecorder }
+
+func (*failingResponseFlush) FlushError() error { return context.DeadlineExceeded }
+
+func TestDiagnosticsInitialFlushPreservesCauseAndSkipsDial(t *testing.T) {
+	ctx := context.WithValue(context.Background(), caddy.ReplacerCtxKey, caddy.NewReplacer())
+	ctx = context.WithValue(ctx, caddyhttp.ExtraLogFieldsCtxKey, new(caddyhttp.ExtraLogFields))
+	h := Handler{Diagnostics: true, HideIP: true, aclRules: []aclRule{&aclAllRule{allow: true}}}
+	h.lookupIP = func(context.Context, string, string) ([]net.IP, error) {
+		t.Fatal("dial path entered before response flush completed")
+		return nil, nil
+	}
+	r := (&http.Request{Method: "CONNECT", Host: "example.invalid:443", URL: &url.URL{Host: "example.invalid:443"}, ProtoMajor: 2, Header: make(http.Header), Body: http.NoBody}).WithContext(ctx)
+	err := h.ServeHTTP(&failingResponseFlush{httptest.NewRecorder()}, r, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("flush cause lost: %v", err)
+	}
+}
+
 func (w *slowWriter) Write(p []byte) (int, error) {
 	time.Sleep(15 * time.Millisecond)
 	return w.Buffer.Write(p)
